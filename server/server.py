@@ -29,6 +29,7 @@ from Tools.price_alerts import (
     session_scope,
     update_price_alert,
 )
+from Tools.price_alerts.scheduler import extract_latest_price
 
 
 mcp = MCPServer("Price Checker")
@@ -51,18 +52,25 @@ def _alert_to_dict(alert) -> dict[str, Any]:
 def create_price_alert_tool(
     product_url: str,
     recipient_email: str,
-    starting_price: int,
-    lowest_notified_price: float,
     alert_id: str | None = None,
     status: PriceAlertStatus = PriceAlertStatus.active,
 ) -> dict[str, Any]:
-    """Create a price alert in Postgres with next_check_at set to tomorrow."""
+    """Create a price alert using the current product price as its baseline."""
+    price_response = check_price_now_tool(product_url)
+    current_price = extract_latest_price(price_response)
+    if current_price is None:
+        return {
+            "success": False,
+            "error": "Could not extract current price from price API response",
+            "price_response": price_response,
+        }
+
     alert = PriceAlertCreate(
         alert_id=alert_id,
         product_url=product_url,
         recipient_email=recipient_email,
-        starting_price=starting_price,
-        lowest_notified_price=lowest_notified_price,
+        starting_price=current_price,
+        lowest_notified_price=current_price,
         status=status,
     )
     with session_scope() as session:
@@ -115,7 +123,7 @@ def update_price_alert_tool(
     alert_id: str,
     product_url: str | None = None,
     recipient_email: str | None = None,
-    starting_price: int | None = None,
+    starting_price: float | None = None,
     lowest_notified_price: float | None = None,
     latest_price: float | None = None,
     last_updated_at: str | None = None,

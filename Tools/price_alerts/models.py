@@ -39,7 +39,7 @@ def _parse_next_check_at(value: Any) -> date:
 class PriceAlertBase(SQLModel):
     product_url: str = Field(min_length=1)
     recipient_email: str = Field(min_length=3, index=True)
-    starting_price: int = Field(ge=0)
+    starting_price: float = Field(ge=0)
     lowest_notified_price: float = Field(ge=0)
     latest_price: float | None = Field(default=None, ge=0)
     last_updated_at: date | None = Field(default=None, sa_column=Column(Date, nullable=True))
@@ -85,7 +85,7 @@ class PriceAlertCreate(SQLModel):
     alert_id: str | None = Field(default=None, min_length=1)
     product_url: str = Field(min_length=1)
     recipient_email: str = Field(min_length=3, index=True)
-    starting_price: int = Field(ge=0)
+    starting_price: float = Field(ge=0)
     lowest_notified_price: float = Field(ge=0)
     status: PriceAlertStatus = Field(default=PriceAlertStatus.active, index=True)
 
@@ -103,7 +103,7 @@ class PriceAlertCreate(SQLModel):
 class PriceAlertUpdate(SQLModel):
     product_url: str | None = Field(default=None, min_length=1)
     recipient_email: str | None = Field(default=None, min_length=3)
-    starting_price: int | None = Field(default=None, ge=0)
+    starting_price: float | None = Field(default=None, ge=0)
     lowest_notified_price: float | None = Field(default=None, ge=0)
     latest_price: float | None = Field(default=None, ge=0)
     last_updated_at: date | None = None

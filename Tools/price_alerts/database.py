@@ -90,6 +90,12 @@ def migrate_price_alerts_table(engine) -> None:
         migrations.append("ALTER TABLE price_alerts ADD COLUMN latest_price DOUBLE PRECISION")
     if "last_updated_at" not in columns:
         migrations.append("ALTER TABLE price_alerts ADD COLUMN last_updated_at DATE")
+    if "starting_price" in columns and "double" not in column_types["starting_price"]:
+        migrations.append(
+            "ALTER TABLE price_alerts "
+            "ALTER COLUMN starting_price TYPE DOUBLE PRECISION "
+            "USING starting_price::double precision"
+        )
     if "lowest_notified_price" in columns and "double" not in column_types["lowest_notified_price"]:
         migrations.append(
             "ALTER TABLE price_alerts "

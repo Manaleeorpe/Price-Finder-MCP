@@ -1,4 +1,5 @@
 import asyncio
+import json
 import sys
 import os
 import threading
@@ -45,6 +46,69 @@ def check_price_now_tool(url: str) -> dict[str, Any]:
 
 def _alert_to_dict(alert) -> dict[str, Any]:
     return alert.model_dump(mode="json")
+
+
+def _alert_resource_payload(alert_id: str) -> dict[str, Any]:
+    alert = get_price_alert_tool(alert_id)
+    if alert.get("success") is False:
+        return alert
+
+    return {
+        "alert_id": alert.get("alert_id"),
+        "product_url": alert.get("product_url"),
+        "starting_price": alert.get("starting_price"),
+        "lowest_notified_price": alert.get("lowest_notified_price"),
+        "latest_price": alert.get("latest_price"),
+        "currency": alert.get("currency"),
+        "last_updated_at": alert.get("last_updated_at"),
+        "next_check_at": alert.get("next_check_at"),
+        "status": alert.get("status"),
+        "last_notification_at": alert.get("last_notification_at"),
+        "notification_delivery_status": alert.get("notification_delivery_status"),
+    }
+
+
+@mcp.resource(
+    "price-alert://alerts/{alert_id}",
+    name="price_alert",
+    title="Price Alert",
+    description="Read an existing price alert without recipient or credential data.",
+    mime_type="application/json",
+)
+def read_price_alert_resource(alert_id: str) -> str:
+    """Read a stored price alert by alert ID."""
+    return json.dumps(_alert_resource_payload(alert_id), ensure_ascii=False)
+
+
+@mcp.prompt(
+    name="review_price_alert",
+    title="Review Price Alert",
+    description="Instruct the client to read and explain a stored price alert.",
+)
+def review_price_alert(alert_id: str) -> list[dict[str, Any]]:
+    """Review an existing price alert from its read-only resource."""
+    resource_uri = f"price-alert://alerts/{alert_id}"
+    return [
+        {
+            "role": "user",
+            "content": (
+                f"Read the MCP resource `{resource_uri}` for alert `{alert_id}` and explain the alert. "
+                "The resource contents are not automatically included in context just because this prompt was "
+                "retrieved, so read the resource before answering.\n\n"
+                "Explain the starting price and latest recorded price. Calculate the absolute change and the "
+                "percentage change from the starting price when both values are present. If `starting_price` is "
+                "zero, missing, or invalid, do not divide by it; say the percentage change cannot be calculated.\n\n"
+                "State whether `latest_price` is strictly below `lowest_notified_price`. Explain that "
+                "`lowest_notified_price` is the notification baseline. If the latest price is below it, say the "
+                "price condition is met, but distinguish that from whether monitoring is active or whether an "
+                "email has actually been sent. Only claim delivery when stored delivery information confirms it.\n\n"
+                "Explain the last check time from `last_updated_at`, the next scheduled check from "
+                "`next_check_at`, and whether monitoring is active based on `status`. Handle missing prices, "
+                "missing timestamps, missing currency, and missing notification delivery data explicitly. Do not "
+                "trigger a fresh price check, scrape a price, send email, or update the alert automatically."
+            ),
+        }
+    ]
 
 
 @mcp.tool()

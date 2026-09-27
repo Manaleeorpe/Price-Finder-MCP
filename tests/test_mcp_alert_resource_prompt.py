@@ -1,0 +1,88 @@
+import json
+import unittest
+from unittest.mock import patch
+
+from server import server
+
+
+class PriceAlertMCPResourcePromptTests(unittest.IsolatedAsyncioTestCase):
+    async def test_resource_template_is_discoverable(self):
+        templates = await server.mcp.list_resource_templates()
+
+        self.assertTrue(
+            any(
+                template.uri_template == "price-alert://alerts/{alert_id}"
+                and template.mime_type == "application/json"
+                for template in templates
+            )
+        )
+
+    async def test_prompt_is_discoverable_with_required_alert_id(self):
+        prompts = await server.mcp.list_prompts()
+        prompt = next(prompt for prompt in prompts if prompt.name == "review_price_alert")
+
+        self.assertEqual(prompt.name, "review_price_alert")
+        self.assertEqual(prompt.arguments[0].name, "alert_id")
+        self.assertTrue(prompt.arguments[0].required)
+
+    async def test_resource_read_returns_sanitized_alert_json(self):
+        alert = {
+            "alert_id": "alert_123",
+            "product_url": "https://example.com/product",
+            "recipient_email": "secret@example.com",
+            "starting_price": 100.0,
+            "lowest_notified_price": 90.0,
+            "latest_price": 95.0,
+            "last_updated_at": "2026-09-27",
+            "next_check_at": "2026-09-28",
+            "status": "active",
+        }
+
+        with patch.object(server, "get_price_alert_tool", return_value=alert):
+            contents = await server.mcp.read_resource("price-alert://alerts/alert_123")
+
+        payload = json.loads(contents[0].content)
+        self.assertEqual(contents[0].mime_type, "application/json")
+        self.assertEqual(payload["alert_id"], "alert_123")
+        self.assertEqual(payload["product_url"], "https://example.com/product")
+        self.assertEqual(payload["currency"], None)
+        self.assertEqual(payload["last_notification_at"], None)
+        self.assertEqual(payload["notification_delivery_status"], None)
+        self.assertNotIn("recipient_email", payload)
+
+    async def test_resource_read_preserves_missing_alert_pattern(self):
+        missing = {"success": False, "error": "Price alert not found: alert_missing"}
+
+        with patch.object(server, "get_price_alert_tool", return_value=missing):
+            contents = await server.mcp.read_resource("price-alert://alerts/alert_missing")
+
+        payload = json.loads(contents[0].content)
+        self.assertEqual(payload, missing)
+
+    async def test_resource_read_uses_get_alert_tool_boundary(self):
+        with patch.object(server, "get_price_alert_tool", return_value={"success": False}) as get_alert:
+            await server.mcp.read_resource("price-alert://alerts/alert_owner")
+
+        get_alert.assert_called_once_with("alert_owner")
+
+    async def test_prompt_rendering_instructs_client_to_read_resource(self):
+        result = await server.mcp.get_prompt(
+            "review_price_alert",
+            {"alert_id": "alert_123"},
+        )
+
+        self.assertEqual(len(result.messages), 1)
+        message = result.messages[0]
+        self.assertEqual(message.role, "user")
+        text = message.content.text
+        self.assertIn("price-alert://alerts/alert_123", text)
+        self.assertIn("`lowest_notified_price` is the notification baseline", text)
+        self.assertIn("Do not trigger a fresh price check", text)
+
+    async def test_prompt_requires_alert_id(self):
+        with self.assertRaises(ValueError):
+            await server.mcp.get_prompt("review_price_alert", {})
+
+
+if __name__ == "__main__":
+    unittest.main()

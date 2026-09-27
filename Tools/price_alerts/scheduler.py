@@ -1,0 +1,204 @@
+import asyncio
+import re
+from datetime import date, datetime, time, timedelta
+from typing import Any
+
+from Tools.json_logging import log_json
+from Tools.price import check_price_now
+from Tools.price_alerts.database import session_scope
+from Tools.price_alerts.models import (
+    PriceAlertUpdate,
+    list_price_alerts_due_today,
+    update_price_alert,
+)
+from Tools.price_alerts.sendMail import send_email
+
+
+CHECK_HOUR = 10
+CHECK_MINUTE = 0
+PRICE_KEYS = (
+    "latest_price",
+    "current_price",
+    "price",
+    "amount",
+    "sale_price",
+    "deal_price",
+    "value",
+)
+
+
+def seconds_until_next_price_alert_run(now: datetime | None = None) -> float:
+    now = now or datetime.now()
+    next_run = datetime.combine(now.date(), time(hour=CHECK_HOUR, minute=CHECK_MINUTE))
+    if now >= next_run:
+        next_run += timedelta(days=1)
+    return (next_run - now).total_seconds()
+
+
+def _coerce_price(value: Any) -> float | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        price = float(value)
+        return price if price >= 0 else None
+    if isinstance(value, str):
+        match = re.search(r"\d+(?:,\d{2,3})*(?:\.\d+)?|\d+(?:\.\d+)?", value)
+        if not match:
+            return None
+        price = float(match.group(0).replace(",", ""))
+        return price if price >= 0 else None
+    return None
+
+
+def extract_latest_price(payload: Any) -> float | None:
+    if isinstance(payload, list):
+        for item in payload:
+            price = extract_latest_price(item)
+            if price is not None:
+                return price
+        return None
+
+    if not isinstance(payload, dict):
+        return _coerce_price(payload)
+
+    normalized_payload = {str(key).lower(): value for key, value in payload.items()}
+    for key in PRICE_KEYS:
+        price = _coerce_price(normalized_payload.get(key))
+        if price is not None:
+            return price
+
+    for value in payload.values():
+        if isinstance(value, dict):
+            price = extract_latest_price(value)
+            if price is not None:
+                return price
+
+    return None
+
+
+def _price_drop_email_body(product_url: str, old_price: float, new_price: float) -> str:
+    return (
+        "Hi,\n\n"
+        "Good news! The price for one of your tracked products has dropped.\n\n"
+        f"Product URL: {product_url}\n"
+        f"Previous lowest notified price: {old_price}\n"
+        f"Current price: {new_price}\n\n"
+        "Regards,\n"
+        "Price Finder"
+    )
+
+
+def run_scheduled_price_alert_check() -> dict[str, Any]:
+    today = date.today()
+    tomorrow = today + timedelta(days=1)
+    summary: dict[str, Any] = {
+        "checked": 0,
+        "updated": 0,
+        "emails_sent": 0,
+        "emails_failed": 0,
+        "failed": 0,
+        "failures": [],
+    }
+
+    with session_scope() as session:
+        alerts = list_price_alerts_due_today(session, limit=None)
+
+        for alert in alerts:
+            summary["checked"] += 1
+            try:
+                price_response = check_price_now(alert.product_url)
+            except Exception as error:
+                price_response = {
+                    "success": False,
+                    "error": f"{error.__class__.__name__}: {error}",
+                }
+            latest_price = extract_latest_price(price_response)
+            lowest_notified_price = None
+            email_failure = None
+
+            if latest_price is not None and latest_price < alert.lowest_notified_price:
+                try:
+                    send_email(
+                        recipient=alert.recipient_email,
+                        subject="Price drop alert",
+                        body=_price_drop_email_body(
+                            alert.product_url,
+                            alert.lowest_notified_price,
+                            latest_price,
+                        ),
+                    )
+                except Exception as error:
+                    email_failure = {
+                        "alert_id": alert.alert_id,
+                        "error": f"Could not send price drop email: {error}",
+                    }
+                    summary["emails_failed"] += 1
+                else:
+                    lowest_notified_price = latest_price
+                    summary["emails_sent"] += 1
+
+            update = PriceAlertUpdate(
+                latest_price=latest_price,
+                lowest_notified_price=lowest_notified_price,
+                last_updated_at=today,
+                next_check_at=tomorrow,
+            )
+            updated_alert = update_price_alert(session, alert.alert_id, update)
+            if updated_alert is None:
+                summary["failed"] += 1
+                summary["failures"].append(
+                    {
+                        "alert_id": alert.alert_id,
+                        "error": "Price alert was not found during update",
+                    }
+                )
+                continue
+
+            if email_failure is not None:
+                summary["failed"] += 1
+                summary["failures"].append(email_failure)
+                continue
+
+            if latest_price is None:
+                summary["failed"] += 1
+                summary["failures"].append(
+                    {
+                        "alert_id": alert.alert_id,
+                        "error": "Could not extract latest price from price API response",
+                        "response": price_response,
+                    }
+                )
+                continue
+
+            summary["updated"] += 1
+
+    log_json("price_alerts.scheduled_check.completed", **summary)
+    return summary
+
+
+async def run_daily_price_alert_scheduler() -> None:
+    try:
+        await asyncio.to_thread(run_scheduled_price_alert_check)
+    except Exception as error:
+        log_json(
+            "price_alerts.scheduled_check.failed",
+            run_phase="startup",
+            error={"type": error.__class__.__name__, "message": str(error)},
+        )
+
+    while True:
+        delay_seconds = seconds_until_next_price_alert_run()
+        log_json(
+            "price_alerts.scheduler.waiting",
+            delay_seconds=round(delay_seconds, 2),
+            check_hour=CHECK_HOUR,
+            check_minute=CHECK_MINUTE,
+        )
+        await asyncio.sleep(delay_seconds)
+        try:
+            await asyncio.to_thread(run_scheduled_price_alert_check)
+        except Exception as error:
+            log_json(
+                "price_alerts.scheduled_check.failed",
+                error={"type": error.__class__.__name__, "message": str(error)},
+            )

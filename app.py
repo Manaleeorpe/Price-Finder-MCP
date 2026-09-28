@@ -1,29 +1,32 @@
 import asyncio
 import os
 
-from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from sqlmodel import Session
 
 from Tools.json_logging import log_api_request
 from Tools.price_alerts import (
     PriceAlertCreate,
+    PriceAlertRole,
     PriceAlertRead,
     PriceAlertStatus,
     PriceAlertUpdate,
+    consume_manual_price_check,
+    count_active_price_alerts,
     create_db_and_tables,
     create_price_alert,
     delete_price_alert,
     get_price_alert,
     get_session,
-    is_price_alert_admin,
+    get_tester_account_by_token_hash,
     is_database_configured,
     list_price_alerts,
     list_price_alerts_due_today,
-    normalize_email,
     run_daily_price_alert_scheduler,
     run_scheduled_price_alert_check,
     update_price_alert,
 )
+from Tools.price_alerts.auth import token_hash
 
 
 app = FastAPI(
@@ -87,30 +90,33 @@ def _forbidden():
     raise HTTPException(status_code=403, detail="Not authorized for this price alert")
 
 
-def _normalize_email_for_request(value: str) -> str:
-    try:
-        return normalize_email(value)
-    except ValueError as error:
-        raise HTTPException(status_code=422, detail=str(error)) from error
+def _bearer_token(authorization: str | None) -> str:
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Bearer token required")
+    token = authorization[7:].strip()
+    if not token:
+        raise HTTPException(status_code=401, detail="Bearer token required")
+    return token
 
 
-def _recipient_scope_for(requester_email: str) -> str | None:
-    requester_email = _normalize_email_for_request(requester_email)
-    return None if is_price_alert_admin(requester_email) else requester_email
+def get_current_tester_account(
+    authorization: str | None = Header(default=None),
+    session: Session = Depends(get_session),
+):
+    account = get_tester_account_by_token_hash(session, token_hash(_bearer_token(authorization)))
+    if account is None:
+        raise HTTPException(status_code=401, detail="Invalid bearer token")
+    return account
 
 
-def _authorize_recipient(requester_email: str, recipient_email: str) -> None:
-    requester_email = _normalize_email_for_request(requester_email)
-    recipient_email = _normalize_email_for_request(recipient_email)
-    if not is_price_alert_admin(requester_email) and requester_email != recipient_email:
-        _forbidden()
+def _owner_scope_for(account) -> str | None:
+    return None if account.role == PriceAlertRole.admin else account.owner_id
 
 
-def _authorize_alert(requester_email: str, alert) -> None:
-    requester_email = _normalize_email_for_request(requester_email)
-    if is_price_alert_admin(requester_email):
+def _authorize_alert(account, alert) -> None:
+    if account.role == PriceAlertRole.admin:
         return
-    if alert.recipient_email != requester_email:
+    if alert.owner_id != account.owner_id:
         _forbidden()
 
 
@@ -122,62 +128,90 @@ def health():
 @app.post("/price-alerts", response_model=PriceAlertRead, status_code=201)
 def api_create_price_alert(
     request: PriceAlertCreate,
-    requester_email: str = Query(..., min_length=3),
+    account=Depends(get_current_tester_account),
     session: Session = Depends(get_session),
 ):
-    _authorize_recipient(requester_email, request.recipient_email)
-    return create_price_alert(session, request)
+    if (
+        request.status == PriceAlertStatus.active
+        and count_active_price_alerts(session, account.owner_id)
+        >= account.active_alert_limit
+    ):
+        raise HTTPException(
+            status_code=429,
+            detail=f"Active alert limit reached: {account.active_alert_limit}",
+        )
+    return create_price_alert(
+        session,
+        PriceAlertCreate(
+            alert_id=request.alert_id,
+            owner_id=account.owner_id,
+            product_url=request.product_url,
+            recipient_email=account.recipient_email,
+            starting_price=request.starting_price,
+            lowest_notified_price=request.lowest_notified_price,
+            status=request.status,
+        ),
+    )
 
 
 @app.get("/price-alerts", response_model=list[PriceAlertRead])
 def api_list_price_alerts(
-    requester_email: str = Query(..., min_length=3),
     status: PriceAlertStatus | None = None,
     limit: int = Query(default=100, ge=1, le=500),
+    account=Depends(get_current_tester_account),
     session: Session = Depends(get_session),
 ):
     return list_price_alerts(
         session,
         status=status,
         limit=limit,
-        recipient_email=_recipient_scope_for(requester_email),
+        owner_id=_owner_scope_for(account),
     )
 
 
 @app.get("/price-alerts/due-today", response_model=list[PriceAlertRead])
 def api_list_price_alerts_due_today(
-    requester_email: str = Query(..., min_length=3),
     status: PriceAlertStatus | None = None,
     limit: int = Query(default=100, ge=1, le=500),
+    account=Depends(get_current_tester_account),
     session: Session = Depends(get_session),
 ):
     return list_price_alerts_due_today(
         session,
         status=status,
         limit=limit,
-        recipient_email=_recipient_scope_for(requester_email),
+        owner_id=_owner_scope_for(account),
     )
 
 
 @app.post("/price-alerts/run-scheduled-check")
 def api_run_scheduled_price_alert_check(
-    requester_email: str = Query(..., min_length=3),
+    account=Depends(get_current_tester_account),
+    session: Session = Depends(get_session),
 ):
+    account, consumed = consume_manual_price_check(session, account.owner_id)
+    if account is None:
+        raise HTTPException(status_code=401, detail="Invalid bearer token")
+    if not consumed:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Daily manual price check limit reached: {account.manual_check_daily_limit}",
+        )
     return run_scheduled_price_alert_check(
-        recipient_email=_recipient_scope_for(requester_email),
+        owner_id=_owner_scope_for(account),
     )
 
 
 @app.get("/price-alerts/{alert_id}", response_model=PriceAlertRead)
 def api_get_price_alert(
     alert_id: str,
-    requester_email: str = Query(..., min_length=3),
+    account=Depends(get_current_tester_account),
     session: Session = Depends(get_session),
 ):
     alert = get_price_alert(session, alert_id)
     if alert is None:
         _handle_missing_alert(alert_id)
-    _authorize_alert(requester_email, alert)
+    _authorize_alert(account, alert)
     return alert
 
 
@@ -185,17 +219,38 @@ def api_get_price_alert(
 def api_update_price_alert(
     alert_id: str,
     request: PriceAlertUpdate,
-    requester_email: str = Query(..., min_length=3),
+    account=Depends(get_current_tester_account),
     session: Session = Depends(get_session),
 ):
     existing_alert = get_price_alert(session, alert_id)
     if existing_alert is None:
         _handle_missing_alert(alert_id)
-    _authorize_alert(requester_email, existing_alert)
-    if request.recipient_email is not None:
-        _authorize_recipient(requester_email, request.recipient_email)
+    _authorize_alert(account, existing_alert)
+    if (
+        request.status == PriceAlertStatus.active
+        and existing_alert.status != PriceAlertStatus.active
+        and existing_alert.owner_id is not None
+        and count_active_price_alerts(session, existing_alert.owner_id)
+        >= account.active_alert_limit
+    ):
+        raise HTTPException(
+            status_code=429,
+            detail=f"Active alert limit reached: {account.active_alert_limit}",
+        )
 
-    alert = update_price_alert(session, alert_id, request)
+    alert = update_price_alert(
+        session,
+        alert_id,
+        PriceAlertUpdate(
+            product_url=request.product_url,
+            starting_price=request.starting_price,
+            lowest_notified_price=request.lowest_notified_price,
+            latest_price=request.latest_price,
+            last_updated_at=request.last_updated_at,
+            status=request.status,
+            next_check_at=request.next_check_at,
+        ),
+    )
     if alert is None:
         _handle_missing_alert(alert_id)
     return alert
@@ -204,13 +259,13 @@ def api_update_price_alert(
 @app.delete("/price-alerts/{alert_id}")
 def api_delete_price_alert(
     alert_id: str,
-    requester_email: str = Query(..., min_length=3),
+    account=Depends(get_current_tester_account),
     session: Session = Depends(get_session),
 ):
     alert = get_price_alert(session, alert_id)
     if alert is None:
         _handle_missing_alert(alert_id)
-    _authorize_alert(requester_email, alert)
+    _authorize_alert(account, alert)
 
     deleted = delete_price_alert(session, alert_id)
     if not deleted:

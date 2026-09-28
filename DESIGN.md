@@ -74,6 +74,7 @@ python railway_start.py
 The `price_alerts` table stores:
 
 - `alert_id`
+- `owner_id`
 - `product_url`
 - `recipient_email`
 - `starting_price`
@@ -100,6 +101,19 @@ The `price_alert_check_audit` table stores one append-only row for each alert ch
 
 This table is written every time a due alert is checked, including failed price lookups where `price` is unavailable.
 
+The `tester_accounts` table stores:
+
+- `owner_id`
+- `token_hash`
+- `recipient_email`
+- `role`
+- `active_alert_limit`
+- `manual_check_daily_limit`
+- `manual_check_count`
+- `manual_check_window_date`
+
+`recipient_email` is configured server-side for each bearer token and is used when creating alerts.
+
 ## REST API
 
 `app.py` exposes:
@@ -115,7 +129,7 @@ PATCH /price-alerts/{alert_id}
 DELETE /price-alerts/{alert_id}
 ```
 
-Alert REST endpoints require `requester_email` as a query parameter for role scoping.
+Alert REST endpoints require a bearer token in the `Authorization` header for role and owner scoping.
 
 FastAPI startup creates/migrates database tables when `DATABASE_URL` is configured. It also starts the scheduler when:
 
@@ -142,22 +156,24 @@ update_price_alert_tool
 delete_price_alert_tool
 ```
 
-`create_price_alert_tool` accepts `product_url` and `recipient_email`, calls `check_price_now_tool` internally, and uses the fetched current price as both `starting_price` and `lowest_notified_price`.
+`create_price_alert_tool` accepts `product_url`, calls `check_price_now_tool` internally, and uses the fetched current price as both `starting_price` and `lowest_notified_price`.
 
-Most alert tools also require `requester_email` for role scoping. `run_scheduled_price_alert_check_tool` manually triggers the same due-alert check used by the daily 10:00 AM Asia/Kolkata scheduler. Admin checks all due alerts; regular users check only their own due alerts.
+MCP requests require a tester bearer token before requests reach tools. The server derives `owner_id`, role, and verified recipient email from that token. `create_price_alert_tool` never accepts a recipient email from the model; it always stores the verified recipient email for the token owner.
+
+`run_scheduled_price_alert_check_tool` manually triggers the same due-alert check used by the daily 10:00 AM Asia/Kolkata scheduler. Admin checks all due alerts; regular users check only their own due alerts. Manual checks are limited per tester per day.
 
 ### Resource
 
 The MCP read-only resource template is:
 
 ```text
-price-alert://users/{requester_email}/alerts/{alert_id}
+price-alert://alerts/{alert_id}
 ```
 
 The MCP client connects to the Railway MCP server URL, then asks that server to read a resource URI such as:
 
 ```text
-price-alert://users/you@example.com/alerts/alert_123
+price-alert://alerts/alert_123
 ```
 
 This resource returns sanitized JSON for a stored alert. It does not include recipient email, tokens, or credentials. It does not check current prices, send email, update Postgres, or mutate the alert.
@@ -170,11 +186,10 @@ The MCP prompt is:
 review_price_alert
 ```
 
-It takes two required arguments:
+It takes one required argument:
 
 ```json
 {
-  "requester_email": "you@example.com",
   "alert_id": "alert_123"
 }
 ```
@@ -214,6 +229,7 @@ DATABASE_URL=...
 PRICE_API_BASE_URL=...
 GMAIL_USER=...
 GMAIL_APP_PASSWORD=...
+TESTER_ACCOUNTS_JSON=...
 ```
 
 For MCP deployment:
@@ -238,12 +254,18 @@ The read-only resource reuses `get_price_alert_tool` to preserve the same get-al
 
 ## Authentication And Ownership
 
-The current codebase uses `requester_email` as the caller identity. It is not a full authentication system, but it enforces two roles at the API and MCP boundaries:
+The current codebase uses one bearer token per tester. MCP streamable HTTP requests are rejected by the MCP auth middleware before tool dispatch unless the bearer token appears in `TESTER_ACCOUNTS_JSON`.
 
-- `orpemanalee@gmail.com` is the admin role and can see, update, delete, and manually check all alerts.
-- Every other email is the user role and is scoped to alerts where `recipient_email` matches `requester_email`.
+For each configured token:
 
-If authentication is added later, it should replace caller-supplied `requester_email` with the authenticated principal while preserving the same role and ownership rules.
+- `owner_id` is derived from the token hash.
+- `recipient_email` is the verified recipient stored for that owner.
+- `active_alert_limit` limits active alerts for that owner.
+- `manual_check_daily_limit` limits command-triggered scheduled checks per day.
+
+`orpemanalee@gmail.com` is the admin recipient and can see, update, delete, and manually check all alerts. Every other tester is the user role and is scoped to alerts where `owner_id` matches the derived owner id from their token.
+
+If authentication is expanded later, it should preserve the same owner-id filtering and server-side verified recipient rule.
 
 ## Deployment Topology
 

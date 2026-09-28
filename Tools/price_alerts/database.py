@@ -6,6 +6,8 @@ from typing import Generator
 from sqlalchemy import inspect, text
 from sqlmodel import Session, SQLModel, create_engine
 
+from Tools.price_alerts.auth import sync_tester_accounts
+
 
 DATABASE_URL_ENV = "DATABASE_URL"
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -70,6 +72,9 @@ def create_db_and_tables() -> None:
     try:
         SQLModel.metadata.create_all(engine)
         migrate_price_alerts_table(engine)
+        migrate_tester_accounts_table(engine)
+        with Session(engine) as session:
+            sync_tester_accounts(session)
     finally:
         engine.dispose()
 
@@ -102,6 +107,42 @@ def migrate_price_alerts_table(engine) -> None:
             "ALTER COLUMN lowest_notified_price TYPE DOUBLE PRECISION "
             "USING lowest_notified_price::double precision"
         )
+
+    if not migrations:
+        return
+
+    with engine.begin() as connection:
+        for statement in migrations:
+            connection.execute(text(statement))
+
+
+def migrate_tester_accounts_table(engine) -> None:
+    """Add columns that create_all will not add to an existing tester table."""
+    inspector = inspect(engine)
+    table_names = inspector.get_table_names()
+    migrations = []
+
+    if "price_alerts" in table_names:
+        columns = {column["name"] for column in inspector.get_columns("price_alerts")}
+        if "owner_id" not in columns:
+            migrations.append("ALTER TABLE price_alerts ADD COLUMN owner_id VARCHAR")
+
+    if "tester_accounts" in table_names:
+        columns = {column["name"] for column in inspector.get_columns("tester_accounts")}
+        if "token_hash" not in columns:
+            migrations.append("ALTER TABLE tester_accounts ADD COLUMN token_hash VARCHAR")
+        if "recipient_email" not in columns:
+            migrations.append("ALTER TABLE tester_accounts ADD COLUMN recipient_email VARCHAR")
+        if "role" not in columns:
+            migrations.append("ALTER TABLE tester_accounts ADD COLUMN role VARCHAR")
+        if "active_alert_limit" not in columns:
+            migrations.append("ALTER TABLE tester_accounts ADD COLUMN active_alert_limit INTEGER")
+        if "manual_check_daily_limit" not in columns:
+            migrations.append("ALTER TABLE tester_accounts ADD COLUMN manual_check_daily_limit INTEGER")
+        if "manual_check_count" not in columns:
+            migrations.append("ALTER TABLE tester_accounts ADD COLUMN manual_check_count INTEGER")
+        if "manual_check_window_date" not in columns:
+            migrations.append("ALTER TABLE tester_accounts ADD COLUMN manual_check_window_date DATE")
 
     if not migrations:
         return

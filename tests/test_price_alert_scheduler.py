@@ -100,6 +100,7 @@ class PriceAlertSchedulerTests(unittest.TestCase):
             session.add(
                 PriceAlert(
                     alert_id="alert_owner",
+                    owner_id="owner_123",
                     product_url="https://example.com/owner",
                     recipient_email="owner@example.com",
                     starting_price=100.0,
@@ -111,6 +112,7 @@ class PriceAlertSchedulerTests(unittest.TestCase):
             session.add(
                 PriceAlert(
                     alert_id="alert_other",
+                    owner_id="owner_456",
                     product_url="https://example.com/other",
                     recipient_email="other@example.com",
                     starting_price=100.0,
@@ -137,7 +139,7 @@ class PriceAlertSchedulerTests(unittest.TestCase):
             ),
         ):
             summary = run_scheduled_price_alert_check(
-                recipient_email="owner@example.com",
+                owner_id="owner_123",
             )
 
         with Session(engine) as session:

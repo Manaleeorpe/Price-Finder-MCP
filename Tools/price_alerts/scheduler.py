@@ -115,6 +115,7 @@ def _price_check_error(price_response: Any) -> str | None:
 
 def run_scheduled_price_alert_check(
     recipient_email: str | None = None,
+    owner_id: str | None = None,
 ) -> dict[str, Any]:
     checked_at = current_price_alert_datetime()
     today = checked_at.date()
@@ -135,6 +136,7 @@ def run_scheduled_price_alert_check(
             limit=None,
             due_date=today,
             recipient_email=recipient_email,
+            owner_id=owner_id,
         )
 
         for alert in alerts:

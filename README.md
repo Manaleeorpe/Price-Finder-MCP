@@ -35,7 +35,8 @@ Required inputs:
 ```json
 {
   "product_url": "https://www.myntra.com/...",
-  "recipient_email": "you@example.com"
+  "recipient_email": "you@example.com",
+  "requester_email": "you@example.com"
 }
 ```
 
@@ -63,6 +64,12 @@ When the latest price becomes lower than the stored notification baseline, the s
 
 Scheduled checks run once per day at 10:00 AM IST. Each check writes an audit row to `price_alert_check_audit` with the alert id, checked timestamp, observed price when available, and any price lookup failure.
 
+## Roles
+
+`orpemanalee@gmail.com` is the admin user and can list, read, update, delete, and manually check all alerts.
+
+Every other requester is treated as a user and can only list, read, update, delete, and manually check alerts where `recipient_email` matches their `requester_email`.
+
 ## Useful MCP Tools
 
 ```text
@@ -76,20 +83,20 @@ delete_price_alert_tool
 check_price_now_tool
 ```
 
-Use `run_scheduled_price_alert_check_tool` when you want to manually trigger the same due-alert check that normally runs at 10:00 AM IST.
+Most alert tools require `requester_email` for role scoping. Use `run_scheduled_price_alert_check_tool` when you want to manually trigger the same due-alert check that normally runs at 10:00 AM IST. Admin checks all due alerts; regular users check only their own due alerts.
 
 ## Review An Alert
 
 The MCP server also exposes a read-only alert resource:
 
 ```text
-price-alert://alerts/{alert_id}
+price-alert://users/{requester_email}/alerts/{alert_id}
 ```
 
 Example:
 
 ```text
-price-alert://alerts/alert_123
+price-alert://users/you@example.com/alerts/alert_123
 ```
 
 And a reusable prompt:

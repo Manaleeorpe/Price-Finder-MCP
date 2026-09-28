@@ -110,9 +110,12 @@ GET /price-alerts
 GET /price-alerts/due-today
 GET /price-alerts/{alert_id}
 POST /price-alerts
+POST /price-alerts/run-scheduled-check
 PATCH /price-alerts/{alert_id}
 DELETE /price-alerts/{alert_id}
 ```
+
+Alert REST endpoints require `requester_email` as a query parameter for role scoping.
 
 FastAPI startup creates/migrates database tables when `DATABASE_URL` is configured. It also starts the scheduler when:
 
@@ -141,20 +144,20 @@ delete_price_alert_tool
 
 `create_price_alert_tool` accepts `product_url` and `recipient_email`, calls `check_price_now_tool` internally, and uses the fetched current price as both `starting_price` and `lowest_notified_price`.
 
-`run_scheduled_price_alert_check_tool` manually triggers the same due-alert check used by the daily 10:00 AM Asia/Kolkata scheduler.
+Most alert tools also require `requester_email` for role scoping. `run_scheduled_price_alert_check_tool` manually triggers the same due-alert check used by the daily 10:00 AM Asia/Kolkata scheduler. Admin checks all due alerts; regular users check only their own due alerts.
 
 ### Resource
 
 The MCP read-only resource template is:
 
 ```text
-price-alert://alerts/{alert_id}
+price-alert://users/{requester_email}/alerts/{alert_id}
 ```
 
 The MCP client connects to the Railway MCP server URL, then asks that server to read a resource URI such as:
 
 ```text
-price-alert://alerts/alert_123
+price-alert://users/you@example.com/alerts/alert_123
 ```
 
 This resource returns sanitized JSON for a stored alert. It does not include recipient email, tokens, or credentials. It does not check current prices, send email, update Postgres, or mutate the alert.
@@ -167,10 +170,11 @@ The MCP prompt is:
 review_price_alert
 ```
 
-It takes one required argument:
+It takes two required arguments:
 
 ```json
 {
+  "requester_email": "you@example.com",
   "alert_id": "alert_123"
 }
 ```
@@ -234,7 +238,12 @@ The read-only resource reuses `get_price_alert_tool` to preserve the same get-al
 
 ## Authentication And Ownership
 
-The current codebase does not implement user authentication or explicit ownership checks for alert tools. The MCP resource preserves the current boundary by reusing `get_price_alert_tool` instead of adding a separate database query. If authentication is added later, it should be implemented in the shared service/tool boundary so tools and resources enforce the same rules.
+The current codebase uses `requester_email` as the caller identity. It is not a full authentication system, but it enforces two roles at the API and MCP boundaries:
+
+- `orpemanalee@gmail.com` is the admin role and can see, update, delete, and manually check all alerts.
+- Every other email is the user role and is scoped to alerts where `recipient_email` matches `requester_email`.
+
+If authentication is added later, it should replace caller-supplied `requester_email` with the authenticated principal while preserving the same role and ownership rules.
 
 ## Deployment Topology
 

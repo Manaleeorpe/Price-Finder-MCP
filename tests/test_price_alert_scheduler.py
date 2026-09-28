@@ -85,6 +85,71 @@ class PriceAlertSchedulerTests(unittest.TestCase):
         self.assertEqual(alert.latest_price, 99.5)
         self.assertEqual(alert.lowest_notified_price, 99.5)
         self.assertEqual(alert.next_check_at, today + timedelta(days=1))
+        engine.dispose()
+
+    def test_scheduled_check_can_be_scoped_to_one_recipient(self):
+        engine = create_engine(
+            "sqlite://",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        SQLModel.metadata.create_all(engine)
+        today = current_price_alert_date()
+
+        with Session(engine) as session:
+            session.add(
+                PriceAlert(
+                    alert_id="alert_owner",
+                    product_url="https://example.com/owner",
+                    recipient_email="owner@example.com",
+                    starting_price=100.0,
+                    lowest_notified_price=90.0,
+                    status=PriceAlertStatus.active,
+                    next_check_at=today,
+                )
+            )
+            session.add(
+                PriceAlert(
+                    alert_id="alert_other",
+                    product_url="https://example.com/other",
+                    recipient_email="other@example.com",
+                    starting_price=100.0,
+                    lowest_notified_price=90.0,
+                    status=PriceAlertStatus.active,
+                    next_check_at=today,
+                )
+            )
+            session.commit()
+
+        @contextmanager
+        def test_session_scope():
+            with Session(engine) as session:
+                yield session
+
+        with (
+            patch(
+                "Tools.price_alerts.scheduler.session_scope",
+                test_session_scope,
+            ),
+            patch(
+                "Tools.price_alerts.scheduler.check_price_now",
+                return_value={"latest_price": 95.0},
+            ),
+        ):
+            summary = run_scheduled_price_alert_check(
+                recipient_email="owner@example.com",
+            )
+
+        with Session(engine) as session:
+            audits = list(session.exec(select(PriceAlertCheckAudit)))
+            other_alert = session.get(PriceAlert, "alert_other")
+
+        self.assertEqual(summary["checked"], 1)
+        self.assertEqual(len(audits), 1)
+        self.assertEqual(audits[0].alert_id, "alert_owner")
+        self.assertIsNone(other_alert.latest_price)
+        self.assertEqual(other_alert.next_check_at, today)
+        engine.dispose()
 
 
 if __name__ == "__main__":

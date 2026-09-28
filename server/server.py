@@ -24,8 +24,10 @@ from Tools.price_alerts import (
     delete_price_alert,
     get_price_alert,
     is_database_configured,
+    is_price_alert_admin,
     list_price_alerts,
     list_price_alerts_due_today,
+    normalize_email,
     run_daily_price_alert_scheduler,
     run_scheduled_price_alert_check,
     session_scope,
@@ -49,8 +51,28 @@ def _alert_to_dict(alert) -> dict[str, Any]:
     return alert.model_dump(mode="json")
 
 
-def _alert_resource_payload(alert_id: str) -> dict[str, Any]:
-    alert = get_price_alert_tool(alert_id)
+def _access_denied() -> dict[str, Any]:
+    return {"success": False, "error": "Not authorized for this price alert"}
+
+
+def _recipient_scope_for(requester_email: str) -> str | None:
+    requester_email = normalize_email(requester_email)
+    return None if is_price_alert_admin(requester_email) else requester_email
+
+
+def _can_access_alert(requester_email: str, alert) -> bool:
+    requester_email = normalize_email(requester_email)
+    return is_price_alert_admin(requester_email) or alert.recipient_email == requester_email
+
+
+def _can_use_recipient(requester_email: str, recipient_email: str) -> bool:
+    requester_email = normalize_email(requester_email)
+    recipient_email = normalize_email(recipient_email)
+    return is_price_alert_admin(requester_email) or requester_email == recipient_email
+
+
+def _alert_resource_payload(requester_email: str, alert_id: str) -> dict[str, Any]:
+    alert = get_price_alert_tool(alert_id, requester_email)
     if alert.get("success") is False:
         return alert
 
@@ -70,15 +92,15 @@ def _alert_resource_payload(alert_id: str) -> dict[str, Any]:
 
 
 @mcp.resource(
-    "price-alert://alerts/{alert_id}",
+    "price-alert://users/{requester_email}/alerts/{alert_id}",
     name="price_alert",
     title="Price Alert",
-    description="Read an existing price alert without recipient or credential data.",
+    description="Read an authorized price alert without recipient or credential data.",
     mime_type="application/json",
 )
-def read_price_alert_resource(alert_id: str) -> str:
+def read_price_alert_resource(requester_email: str, alert_id: str) -> str:
     """Read a stored price alert by alert ID."""
-    return json.dumps(_alert_resource_payload(alert_id), ensure_ascii=False)
+    return json.dumps(_alert_resource_payload(requester_email, alert_id), ensure_ascii=False)
 
 
 @mcp.prompt(
@@ -86,9 +108,9 @@ def read_price_alert_resource(alert_id: str) -> str:
     title="Review Price Alert",
     description="Instruct the client to read and explain a stored price alert.",
 )
-def review_price_alert(alert_id: str) -> list[dict[str, Any]]:
-    """Review an existing price alert from its read-only resource."""
-    resource_uri = f"price-alert://alerts/{alert_id}"
+def review_price_alert(requester_email: str, alert_id: str) -> list[dict[str, Any]]:
+    """Review an existing authorized price alert from its read-only resource."""
+    resource_uri = f"price-alert://users/{requester_email}/alerts/{alert_id}"
     return [
         {
             "role": "user",
@@ -117,10 +139,14 @@ def review_price_alert(alert_id: str) -> list[dict[str, Any]]:
 def create_price_alert_tool(
     product_url: str,
     recipient_email: str,
+    requester_email: str,
     alert_id: str | None = None,
     status: PriceAlertStatus = PriceAlertStatus.active,
 ) -> dict[str, Any]:
     """Create a price alert using the current product price as its baseline."""
+    if not _can_use_recipient(requester_email, recipient_email):
+        return _access_denied()
+
     price_response = check_price_now_tool(product_url)
     current_price = extract_latest_price(price_response)
     if current_price is None:
@@ -144,29 +170,41 @@ def create_price_alert_tool(
 
 @mcp.tool()
 @log_mcp_tool("get_price_alert_tool")
-def get_price_alert_tool(alert_id: str) -> dict[str, Any]:
+def get_price_alert_tool(alert_id: str, requester_email: str) -> dict[str, Any]:
     """Get a price alert by ID from Postgres."""
     with session_scope() as session:
         alert = get_price_alert(session, alert_id)
         if alert is None:
             return {"success": False, "error": f"Price alert not found: {alert_id}"}
+        if not _can_access_alert(requester_email, alert):
+            return _access_denied()
         return _alert_to_dict(alert)
 
 
 @mcp.tool()
 @log_mcp_tool("list_price_alerts_tool")
 def list_price_alerts_tool(
+    requester_email: str,
     status: PriceAlertStatus | None = None,
     limit: int = 100,
 ) -> list[dict[str, Any]]:
     """List price alerts from Postgres."""
     with session_scope() as session:
-        return [_alert_to_dict(alert) for alert in list_price_alerts(session, status=status, limit=limit)]
+        return [
+            _alert_to_dict(alert)
+            for alert in list_price_alerts(
+                session,
+                status=status,
+                limit=limit,
+                recipient_email=_recipient_scope_for(requester_email),
+            )
+        ]
 
 
 @mcp.tool()
 @log_mcp_tool("list_price_alerts_due_today_tool")
 def list_price_alerts_due_today_tool(
+    requester_email: str,
     status: PriceAlertStatus | None = None,
     limit: int = 100,
 ) -> list[dict[str, Any]]:
@@ -178,21 +216,25 @@ def list_price_alerts_due_today_tool(
                 session,
                 status=status,
                 limit=limit,
+                recipient_email=_recipient_scope_for(requester_email),
             )
         ]
 
 
 @mcp.tool()
 @log_mcp_tool("run_scheduled_price_alert_check_tool")
-def run_scheduled_price_alert_check_tool() -> dict[str, Any]:
+def run_scheduled_price_alert_check_tool(requester_email: str) -> dict[str, Any]:
     """Manually run the due alert check that normally runs daily at 10:00 AM IST."""
-    return run_scheduled_price_alert_check()
+    return run_scheduled_price_alert_check(
+        recipient_email=_recipient_scope_for(requester_email),
+    )
 
 
 @mcp.tool()
 @log_mcp_tool("update_price_alert_tool")
 def update_price_alert_tool(
     alert_id: str,
+    requester_email: str,
     product_url: str | None = None,
     recipient_email: str | None = None,
     starting_price: float | None = None,
@@ -203,6 +245,12 @@ def update_price_alert_tool(
     next_check_at: str | None = None,
 ) -> dict[str, Any]:
     """Update a price alert in Postgres."""
+    if recipient_email is not None and not _can_use_recipient(
+        requester_email,
+        recipient_email,
+    ):
+        return _access_denied()
+
     alert_update = PriceAlertUpdate(
         product_url=product_url,
         recipient_email=recipient_email,
@@ -214,6 +262,12 @@ def update_price_alert_tool(
         next_check_at=next_check_at,
     )
     with session_scope() as session:
+        existing_alert = get_price_alert(session, alert_id)
+        if existing_alert is None:
+            return {"success": False, "error": f"Price alert not found: {alert_id}"}
+        if not _can_access_alert(requester_email, existing_alert):
+            return _access_denied()
+
         alert = update_price_alert(session, alert_id, alert_update)
         if alert is None:
             return {"success": False, "error": f"Price alert not found: {alert_id}"}
@@ -222,9 +276,15 @@ def update_price_alert_tool(
 
 @mcp.tool()
 @log_mcp_tool("delete_price_alert_tool")
-def delete_price_alert_tool(alert_id: str) -> dict[str, Any]:
+def delete_price_alert_tool(alert_id: str, requester_email: str) -> dict[str, Any]:
     """Delete a price alert from Postgres."""
     with session_scope() as session:
+        alert = get_price_alert(session, alert_id)
+        if alert is None:
+            return {"success": False, "error": f"Price alert not found: {alert_id}"}
+        if not _can_access_alert(requester_email, alert):
+            return _access_denied()
+
         deleted = delete_price_alert(session, alert_id)
         if not deleted:
             return {"success": False, "error": f"Price alert not found: {alert_id}"}

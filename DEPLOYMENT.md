@@ -35,6 +35,7 @@ GET /health
 GET /price-alerts
 GET /price-alerts/due-today
 POST /price-alerts
+POST /price-alerts/run-scheduled-check
 PATCH /price-alerts/{alert_id}
 DELETE /price-alerts/{alert_id}
 ```

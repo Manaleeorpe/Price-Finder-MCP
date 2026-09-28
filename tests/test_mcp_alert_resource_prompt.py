@@ -11,7 +11,8 @@ class PriceAlertMCPResourcePromptTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(
             any(
-                template.uri_template == "price-alert://alerts/{alert_id}"
+                template.uri_template
+                == "price-alert://users/{requester_email}/alerts/{alert_id}"
                 and template.mime_type == "application/json"
                 for template in templates
             )
@@ -22,8 +23,10 @@ class PriceAlertMCPResourcePromptTests(unittest.IsolatedAsyncioTestCase):
         prompt = next(prompt for prompt in prompts if prompt.name == "review_price_alert")
 
         self.assertEqual(prompt.name, "review_price_alert")
-        self.assertEqual(prompt.arguments[0].name, "alert_id")
+        self.assertEqual(prompt.arguments[0].name, "requester_email")
         self.assertTrue(prompt.arguments[0].required)
+        self.assertEqual(prompt.arguments[1].name, "alert_id")
+        self.assertTrue(prompt.arguments[1].required)
 
     async def test_manual_scheduled_check_tool_is_discoverable(self):
         tools = await server.mcp.list_tools()
@@ -48,10 +51,35 @@ class PriceAlertMCPResourcePromptTests(unittest.IsolatedAsyncioTestCase):
             "run_scheduled_price_alert_check",
             return_value=summary,
         ) as run_check:
-            result = server.run_scheduled_price_alert_check_tool()
+            result = server.run_scheduled_price_alert_check_tool(
+                "orpemanalee@gmail.com",
+            )
 
         self.assertEqual(result, summary)
-        run_check.assert_called_once_with()
+        run_check.assert_called_once_with(recipient_email=None)
+
+    async def test_manual_scheduled_check_tool_scopes_non_admin_user(self):
+        summary = {
+            "checked": 1,
+            "audited": 1,
+            "updated": 1,
+            "emails_sent": 0,
+            "emails_failed": 0,
+            "failed": 0,
+            "failures": [],
+        }
+
+        with patch.object(
+            server,
+            "run_scheduled_price_alert_check",
+            return_value=summary,
+        ) as run_check:
+            result = server.run_scheduled_price_alert_check_tool(
+                "Buyer@Example.com",
+            )
+
+        self.assertEqual(result, summary)
+        run_check.assert_called_once_with(recipient_email="buyer@example.com")
 
     async def test_resource_read_returns_sanitized_alert_json(self):
         alert = {
@@ -67,7 +95,9 @@ class PriceAlertMCPResourcePromptTests(unittest.IsolatedAsyncioTestCase):
         }
 
         with patch.object(server, "get_price_alert_tool", return_value=alert):
-            contents = await server.mcp.read_resource("price-alert://alerts/alert_123")
+            contents = await server.mcp.read_resource(
+                "price-alert://users/secret@example.com/alerts/alert_123"
+            )
 
         payload = json.loads(contents[0].content)
         self.assertEqual(contents[0].mime_type, "application/json")
@@ -82,32 +112,39 @@ class PriceAlertMCPResourcePromptTests(unittest.IsolatedAsyncioTestCase):
         missing = {"success": False, "error": "Price alert not found: alert_missing"}
 
         with patch.object(server, "get_price_alert_tool", return_value=missing):
-            contents = await server.mcp.read_resource("price-alert://alerts/alert_missing")
+            contents = await server.mcp.read_resource(
+                "price-alert://users/secret@example.com/alerts/alert_missing"
+            )
 
         payload = json.loads(contents[0].content)
         self.assertEqual(payload, missing)
 
     async def test_resource_read_uses_get_alert_tool_boundary(self):
         with patch.object(server, "get_price_alert_tool", return_value={"success": False}) as get_alert:
-            await server.mcp.read_resource("price-alert://alerts/alert_owner")
+            await server.mcp.read_resource(
+                "price-alert://users/owner@example.com/alerts/alert_owner"
+            )
 
-        get_alert.assert_called_once_with("alert_owner")
+        get_alert.assert_called_once_with("alert_owner", "owner@example.com")
 
     async def test_prompt_rendering_instructs_client_to_read_resource(self):
         result = await server.mcp.get_prompt(
             "review_price_alert",
-            {"alert_id": "alert_123"},
+            {
+                "requester_email": "owner@example.com",
+                "alert_id": "alert_123",
+            },
         )
 
         self.assertEqual(len(result.messages), 1)
         message = result.messages[0]
         self.assertEqual(message.role, "user")
         text = message.content.text
-        self.assertIn("price-alert://alerts/alert_123", text)
+        self.assertIn("price-alert://users/owner@example.com/alerts/alert_123", text)
         self.assertIn("`lowest_notified_price` is the notification baseline", text)
         self.assertIn("Do not trigger a fresh price check", text)
 
-    async def test_prompt_requires_alert_id(self):
+    async def test_prompt_requires_requester_email_and_alert_id(self):
         with self.assertRaises(ValueError):
             await server.mcp.get_prompt("review_price_alert", {})
 

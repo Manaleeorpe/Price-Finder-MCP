@@ -113,7 +113,9 @@ def _price_check_error(price_response: Any) -> str | None:
     return None
 
 
-def run_scheduled_price_alert_check() -> dict[str, Any]:
+def run_scheduled_price_alert_check(
+    recipient_email: str | None = None,
+) -> dict[str, Any]:
     checked_at = current_price_alert_datetime()
     today = checked_at.date()
     tomorrow = today + timedelta(days=1)
@@ -128,7 +130,12 @@ def run_scheduled_price_alert_check() -> dict[str, Any]:
     }
 
     with session_scope() as session:
-        alerts = list_price_alerts_due_today(session, limit=None, due_date=today)
+        alerts = list_price_alerts_due_today(
+            session,
+            limit=None,
+            due_date=today,
+            recipient_email=recipient_email,
+        )
 
         for alert in alerts:
             summary["checked"] += 1

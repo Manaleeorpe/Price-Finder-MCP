@@ -12,6 +12,12 @@ from sqlmodel import Field, Session, SQLModel, select
 
 PRICE_ALERT_TIME_ZONE_NAME = "Asia/Kolkata"
 PRICE_ALERT_TIME_ZONE = ZoneInfo(PRICE_ALERT_TIME_ZONE_NAME)
+PRICE_ALERT_ADMIN_EMAIL = "orpemanalee@gmail.com"
+
+
+class PriceAlertRole(str, Enum):
+    admin = "admin"
+    user = "user"
 
 
 class PriceAlertStatus(str, Enum):
@@ -26,6 +32,25 @@ def _default_alert_id() -> str:
 
 def _default_audit_id() -> str:
     return f"audit_{uuid4().hex[:12]}"
+
+
+def normalize_email(value: str) -> str:
+    value = value.strip().lower()
+    if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", value):
+        raise ValueError("email must be a valid email address")
+    return value
+
+
+def get_price_alert_role(email: str) -> PriceAlertRole:
+    return (
+        PriceAlertRole.admin
+        if normalize_email(email) == PRICE_ALERT_ADMIN_EMAIL
+        else PriceAlertRole.user
+    )
+
+
+def is_price_alert_admin(email: str) -> bool:
+    return get_price_alert_role(email) == PriceAlertRole.admin
 
 
 def current_price_alert_datetime() -> datetime:
@@ -74,10 +99,7 @@ class PriceAlertBase(SQLModel):
     @field_validator("recipient_email")
     @classmethod
     def validate_recipient_email(cls, value: str) -> str:
-        value = value.strip().lower()
-        if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", value):
-            raise ValueError("recipient_email must be a valid email address")
-        return value
+        return normalize_email(value)
 
     @field_validator("next_check_at", mode="before")
     @classmethod
@@ -230,10 +252,13 @@ def list_price_alerts(
     session: Session,
     status: PriceAlertStatus | None = None,
     limit: int | None = 100,
+    recipient_email: str | None = None,
 ) -> list[PriceAlert]:
     statement = select(PriceAlert)
     if status is not None:
         statement = statement.where(PriceAlert.status == status)
+    if recipient_email is not None:
+        statement = statement.where(PriceAlert.recipient_email == normalize_email(recipient_email))
     if limit is not None:
         statement = statement.limit(limit)
     return list(session.exec(statement))
@@ -244,11 +269,14 @@ def list_price_alerts_due_today(
     status: PriceAlertStatus | None = None,
     limit: int | None = 100,
     due_date: date | None = None,
+    recipient_email: str | None = None,
 ) -> list[PriceAlert]:
     due_date = due_date or current_price_alert_date()
     statement = select(PriceAlert).where(PriceAlert.next_check_at == due_date)
     if status is not None:
         statement = statement.where(PriceAlert.status == status)
+    if recipient_email is not None:
+        statement = statement.where(PriceAlert.recipient_email == normalize_email(recipient_email))
     if limit is not None:
         statement = statement.limit(limit)
     return list(session.exec(statement))

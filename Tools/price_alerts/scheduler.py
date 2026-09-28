@@ -1,13 +1,18 @@
 import asyncio
 import re
-from datetime import date, datetime, time, timedelta
+from datetime import datetime, time, timedelta
 from typing import Any
 
 from Tools.json_logging import log_json
 from Tools.price import check_price_now
 from Tools.price_alerts.database import session_scope
 from Tools.price_alerts.models import (
+    PRICE_ALERT_TIME_ZONE,
+    PRICE_ALERT_TIME_ZONE_NAME,
+    PriceAlertCheckAuditCreate,
     PriceAlertUpdate,
+    create_price_alert_check_audit,
+    current_price_alert_datetime,
     list_price_alerts_due_today,
     update_price_alert,
 )
@@ -27,9 +32,19 @@ PRICE_KEYS = (
 )
 
 
+def _as_price_alert_timezone(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=PRICE_ALERT_TIME_ZONE)
+    return value.astimezone(PRICE_ALERT_TIME_ZONE)
+
+
 def seconds_until_next_price_alert_run(now: datetime | None = None) -> float:
-    now = now or datetime.now()
-    next_run = datetime.combine(now.date(), time(hour=CHECK_HOUR, minute=CHECK_MINUTE))
+    now = _as_price_alert_timezone(now or current_price_alert_datetime())
+    next_run = datetime.combine(
+        now.date(),
+        time(hour=CHECK_HOUR, minute=CHECK_MINUTE),
+        tzinfo=PRICE_ALERT_TIME_ZONE,
+    )
     if now >= next_run:
         next_run += timedelta(days=1)
     return (next_run - now).total_seconds()
@@ -88,11 +103,23 @@ def _price_drop_email_body(product_url: str, old_price: float, new_price: float)
     )
 
 
+def _price_check_error(price_response: Any) -> str | None:
+    if isinstance(price_response, dict):
+        error = price_response.get("error")
+        if error:
+            return str(error)
+        if price_response.get("success") is False:
+            return "Price API response did not include a successful result"
+    return None
+
+
 def run_scheduled_price_alert_check() -> dict[str, Any]:
-    today = date.today()
+    checked_at = current_price_alert_datetime()
+    today = checked_at.date()
     tomorrow = today + timedelta(days=1)
     summary: dict[str, Any] = {
         "checked": 0,
+        "audited": 0,
         "updated": 0,
         "emails_sent": 0,
         "emails_failed": 0,
@@ -101,10 +128,11 @@ def run_scheduled_price_alert_check() -> dict[str, Any]:
     }
 
     with session_scope() as session:
-        alerts = list_price_alerts_due_today(session, limit=None)
+        alerts = list_price_alerts_due_today(session, limit=None, due_date=today)
 
         for alert in alerts:
             summary["checked"] += 1
+            alert_checked_at = current_price_alert_datetime()
             try:
                 price_response = check_price_now(alert.product_url)
             except Exception as error:
@@ -113,6 +141,34 @@ def run_scheduled_price_alert_check() -> dict[str, Any]:
                     "error": f"{error.__class__.__name__}: {error}",
                 }
             latest_price = extract_latest_price(price_response)
+            audit_error = _price_check_error(price_response)
+            if latest_price is None and audit_error is None:
+                audit_error = "Could not extract latest price from price API response"
+            try:
+                create_price_alert_check_audit(
+                    session,
+                    PriceAlertCheckAuditCreate(
+                        alert_id=alert.alert_id,
+                        product_url=alert.product_url,
+                        checked_at=alert_checked_at,
+                        checked_on=alert_checked_at.date(),
+                        price=latest_price,
+                        success=latest_price is not None,
+                        error=audit_error,
+                    ),
+                )
+            except Exception as error:
+                session.rollback()
+                summary["failed"] += 1
+                summary["failures"].append(
+                    {
+                        "alert_id": alert.alert_id,
+                        "error": f"Could not write price check audit: {error}",
+                    }
+                )
+            else:
+                summary["audited"] += 1
+
             lowest_notified_price = None
             email_failure = None
 
@@ -177,15 +233,6 @@ def run_scheduled_price_alert_check() -> dict[str, Any]:
 
 
 async def run_daily_price_alert_scheduler() -> None:
-    try:
-        await asyncio.to_thread(run_scheduled_price_alert_check)
-    except Exception as error:
-        log_json(
-            "price_alerts.scheduled_check.failed",
-            run_phase="startup",
-            error={"type": error.__class__.__name__, "message": str(error)},
-        )
-
     while True:
         delay_seconds = seconds_until_next_price_alert_run()
         log_json(
@@ -193,6 +240,7 @@ async def run_daily_price_alert_scheduler() -> None:
             delay_seconds=round(delay_seconds, 2),
             check_hour=CHECK_HOUR,
             check_minute=CHECK_MINUTE,
+            check_timezone=PRICE_ALERT_TIME_ZONE_NAME,
         )
         await asyncio.sleep(delay_seconds)
         try:

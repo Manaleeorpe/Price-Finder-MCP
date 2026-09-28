@@ -83,3 +83,5 @@ GMAIL_APP_PASSWORD=...
 ```
 
 Only one deployed service should have `PRICE_ALERT_SCHEDULER_ENABLED=true`, otherwise both services can process the same due alerts and send duplicate emails.
+
+The scheduler waits for 10:00 AM IST (`Asia/Kolkata`) and writes one `price_alert_check_audit` row per checked alert.

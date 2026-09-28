@@ -61,6 +61,8 @@ The scheduler checks due alerts automatically.
 
 When the latest price becomes lower than the stored notification baseline, the system sends an email to the alert recipient and updates the baseline to the new lower price.
 
+Scheduled checks run once per day at 10:00 AM IST. Each check writes an audit row to `price_alert_check_audit` with the alert id, checked timestamp, observed price when available, and any price lookup failure.
+
 ## Useful MCP Tools
 
 ```text

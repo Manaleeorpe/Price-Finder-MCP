@@ -87,6 +87,19 @@ The `price_alerts` table stores:
 
 `latest_price` and `last_updated_at` are updated by scheduled checks. `next_check_at` controls which alerts are due for the next scheduled run.
 
+The `price_alert_check_audit` table stores one append-only row for each alert check:
+
+- `audit_id`
+- `alert_id`
+- `product_url`
+- `checked_at`
+- `checked_on`
+- `price`
+- `success`
+- `error`
+
+This table is written every time a due alert is checked, including failed price lookups where `price` is unavailable.
+
 ## REST API
 
 `app.py` exposes:
@@ -165,15 +178,16 @@ The prompt is only an instruction template. It tells the MCP client or AI to rea
 
 The scheduler lives in `Tools/price_alerts/scheduler.py`.
 
-1. On scheduler startup, run one due-alert check immediately.
-2. Wait until the next scheduled time.
-3. Fetch alerts where `next_check_at == date.today()`.
-4. For each due alert:
+1. Wait until the next 10:00 AM Asia/Kolkata run.
+2. Fetch alerts where `next_check_at` matches today's Asia/Kolkata date.
+3. For each due alert:
    - call the configured price API through `check_price_now`
    - extract `latest_price`
+   - insert a `price_alert_check_audit` row with the checked price or failure reason
    - update `latest_price`, `last_updated_at`, and `next_check_at`
    - if `latest_price < lowest_notified_price`, send an email
    - only after email succeeds, update `lowest_notified_price`
+4. Repeat daily at 10:00 AM Asia/Kolkata.
 
 Only one deployed service should run the scheduler. Running it from multiple services can duplicate price checks and notification emails.
 

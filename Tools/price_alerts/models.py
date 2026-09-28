@@ -2,11 +2,16 @@ import re
 from datetime import date, datetime, timedelta
 from enum import Enum
 from typing import Any
+from zoneinfo import ZoneInfo
 from uuid import uuid4
 
 from pydantic import field_validator
-from sqlalchemy import Column, Date
+from sqlalchemy import Column, Date, DateTime
 from sqlmodel import Field, Session, SQLModel, select
+
+
+PRICE_ALERT_TIME_ZONE_NAME = "Asia/Kolkata"
+PRICE_ALERT_TIME_ZONE = ZoneInfo(PRICE_ALERT_TIME_ZONE_NAME)
 
 
 class PriceAlertStatus(str, Enum):
@@ -19,8 +24,20 @@ def _default_alert_id() -> str:
     return f"alert_{uuid4().hex[:12]}"
 
 
+def _default_audit_id() -> str:
+    return f"audit_{uuid4().hex[:12]}"
+
+
+def current_price_alert_datetime() -> datetime:
+    return datetime.now(PRICE_ALERT_TIME_ZONE)
+
+
+def current_price_alert_date() -> date:
+    return current_price_alert_datetime().date()
+
+
 def _default_next_check_at() -> date:
-    return date.today() + timedelta(days=1)
+    return current_price_alert_date() + timedelta(days=1)
 
 
 def _parse_next_check_at(value: Any) -> date:
@@ -143,6 +160,41 @@ class PriceAlertRead(PriceAlertBase):
     alert_id: str
 
 
+class PriceAlertCheckAuditBase(SQLModel):
+    alert_id: str = Field(min_length=1, index=True)
+    product_url: str = Field(min_length=1)
+    checked_at: datetime = Field(
+        default_factory=current_price_alert_datetime,
+        sa_column=Column(DateTime(timezone=True), nullable=False),
+    )
+    checked_on: date = Field(
+        default_factory=current_price_alert_date,
+        sa_column=Column(Date, nullable=False, index=True),
+    )
+    price: float | None = Field(default=None, ge=0)
+    success: bool = Field(default=False, index=True)
+    error: str | None = Field(default=None)
+
+    @field_validator("product_url")
+    @classmethod
+    def validate_product_url(cls, value: str) -> str:
+        return PriceAlertBase.validate_product_url(value)
+
+
+class PriceAlertCheckAudit(PriceAlertCheckAuditBase, table=True):
+    __tablename__ = "price_alert_check_audit"
+
+    audit_id: str = Field(default_factory=_default_audit_id, primary_key=True, index=True)
+
+
+class PriceAlertCheckAuditCreate(PriceAlertCheckAuditBase):
+    pass
+
+
+class PriceAlertCheckAuditRead(PriceAlertCheckAuditBase):
+    audit_id: str
+
+
 def create_price_alert(session: Session, alert: PriceAlertCreate) -> PriceAlert:
     db_alert = PriceAlert(
         alert_id=alert.alert_id or _default_alert_id(),
@@ -157,6 +209,17 @@ def create_price_alert(session: Session, alert: PriceAlertCreate) -> PriceAlert:
     session.commit()
     session.refresh(db_alert)
     return db_alert
+
+
+def create_price_alert_check_audit(
+    session: Session,
+    audit: PriceAlertCheckAuditCreate,
+) -> PriceAlertCheckAudit:
+    db_audit = PriceAlertCheckAudit(**audit.model_dump())
+    session.add(db_audit)
+    session.commit()
+    session.refresh(db_audit)
+    return db_audit
 
 
 def get_price_alert(session: Session, alert_id: str) -> PriceAlert | None:
@@ -180,8 +243,10 @@ def list_price_alerts_due_today(
     session: Session,
     status: PriceAlertStatus | None = None,
     limit: int | None = 100,
+    due_date: date | None = None,
 ) -> list[PriceAlert]:
-    statement = select(PriceAlert).where(PriceAlert.next_check_at == date.today())
+    due_date = due_date or current_price_alert_date()
+    statement = select(PriceAlert).where(PriceAlert.next_check_at == due_date)
     if status is not None:
         statement = statement.where(PriceAlert.status == status)
     if limit is not None:

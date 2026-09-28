@@ -69,11 +69,14 @@ Scheduled checks run once per day at 10:00 AM IST. Each check writes an audit ro
 create_price_alert_tool
 list_price_alerts_tool
 list_price_alerts_due_today_tool
+run_scheduled_price_alert_check_tool
 get_price_alert_tool
 update_price_alert_tool
 delete_price_alert_tool
 check_price_now_tool
 ```
+
+Use `run_scheduled_price_alert_check_tool` when you want to manually trigger the same due-alert check that normally runs at 10:00 AM IST.
 
 ## Review An Alert
 

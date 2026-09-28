@@ -25,6 +25,34 @@ class PriceAlertMCPResourcePromptTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(prompt.arguments[0].name, "alert_id")
         self.assertTrue(prompt.arguments[0].required)
 
+    async def test_manual_scheduled_check_tool_is_discoverable(self):
+        tools = await server.mcp.list_tools()
+
+        self.assertTrue(
+            any(tool.name == "run_scheduled_price_alert_check_tool" for tool in tools)
+        )
+
+    async def test_manual_scheduled_check_tool_runs_scheduler_boundary(self):
+        summary = {
+            "checked": 1,
+            "audited": 1,
+            "updated": 1,
+            "emails_sent": 0,
+            "emails_failed": 0,
+            "failed": 0,
+            "failures": [],
+        }
+
+        with patch.object(
+            server,
+            "run_scheduled_price_alert_check",
+            return_value=summary,
+        ) as run_check:
+            result = server.run_scheduled_price_alert_check_tool()
+
+        self.assertEqual(result, summary)
+        run_check.assert_called_once_with()
+
     async def test_resource_read_returns_sanitized_alert_json(self):
         alert = {
             "alert_id": "alert_123",

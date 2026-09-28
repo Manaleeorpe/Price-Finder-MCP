@@ -27,6 +27,7 @@ from Tools.price_alerts import (
     list_price_alerts,
     list_price_alerts_due_today,
     run_daily_price_alert_scheduler,
+    run_scheduled_price_alert_check,
     session_scope,
     update_price_alert,
 )
@@ -179,6 +180,13 @@ def list_price_alerts_due_today_tool(
                 limit=limit,
             )
         ]
+
+
+@mcp.tool()
+@log_mcp_tool("run_scheduled_price_alert_check_tool")
+def run_scheduled_price_alert_check_tool() -> dict[str, Any]:
+    """Manually run the due alert check that normally runs daily at 10:00 AM IST."""
+    return run_scheduled_price_alert_check()
 
 
 @mcp.tool()

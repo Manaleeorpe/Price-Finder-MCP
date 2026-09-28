@@ -134,11 +134,14 @@ create_price_alert_tool
 get_price_alert_tool
 list_price_alerts_tool
 list_price_alerts_due_today_tool
+run_scheduled_price_alert_check_tool
 update_price_alert_tool
 delete_price_alert_tool
 ```
 
 `create_price_alert_tool` accepts `product_url` and `recipient_email`, calls `check_price_now_tool` internally, and uses the fetched current price as both `starting_price` and `lowest_notified_price`.
+
+`run_scheduled_price_alert_check_tool` manually triggers the same due-alert check used by the daily 10:00 AM Asia/Kolkata scheduler.
 
 ### Resource
 

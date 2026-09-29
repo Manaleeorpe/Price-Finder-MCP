@@ -15,33 +15,10 @@ PRICE_ALERT_TIME_ZONE = ZoneInfo(PRICE_ALERT_TIME_ZONE_NAME)
 PRICE_ALERT_ADMIN_EMAIL = "orpemanalee@gmail.com"
 
 
-class PriceAlertRole(str, Enum):
-    admin = "admin"
-    user = "user"
-
-
 class PriceAlertStatus(str, Enum):
     active = "active"
     paused = "paused"
     disabled = "disabled"
-
-
-class TesterAccount(SQLModel, table=True):
-    __tablename__ = "tester_accounts"
-
-    owner_id: str = Field(primary_key=True, index=True)
-    token_hash: str = Field(index=True, unique=True)
-    recipient_email: str = Field(min_length=3, index=True)
-    role: PriceAlertRole = Field(default=PriceAlertRole.user, index=True)
-    active_alert_limit: int = Field(default=5, ge=0)
-    manual_check_daily_limit: int = Field(default=3, ge=0)
-    manual_check_count: int = Field(default=0, ge=0)
-    manual_check_window_date: date | None = Field(default=None, sa_column=Column(Date, nullable=True))
-
-    @field_validator("recipient_email")
-    @classmethod
-    def validate_recipient_email(cls, value: str) -> str:
-        return normalize_email(value)
 
 
 def _default_alert_id() -> str:
@@ -59,16 +36,8 @@ def normalize_email(value: str) -> str:
     return value
 
 
-def get_price_alert_role(email: str) -> PriceAlertRole:
-    return (
-        PriceAlertRole.admin
-        if normalize_email(email) == PRICE_ALERT_ADMIN_EMAIL
-        else PriceAlertRole.user
-    )
-
-
 def is_price_alert_admin(email: str) -> bool:
-    return get_price_alert_role(email) == PriceAlertRole.admin
+    return normalize_email(email) == PRICE_ALERT_ADMIN_EMAIL
 
 
 def current_price_alert_datetime() -> datetime:
@@ -97,7 +66,6 @@ def _parse_next_check_at(value: Any) -> date:
 
 
 class PriceAlertBase(SQLModel):
-    owner_id: str | None = Field(default=None, index=True)
     product_url: str = Field(min_length=1)
     recipient_email: str = Field(min_length=3, index=True)
     starting_price: float = Field(ge=0)
@@ -141,7 +109,6 @@ class PriceAlert(PriceAlertBase, table=True):
 
 class PriceAlertCreate(SQLModel):
     alert_id: str | None = Field(default=None, min_length=1)
-    owner_id: str | None = Field(default=None, min_length=1)
     product_url: str = Field(min_length=1)
     recipient_email: str = Field(min_length=3, index=True)
     starting_price: float = Field(ge=0)
@@ -160,7 +127,6 @@ class PriceAlertCreate(SQLModel):
 
 
 class PriceAlertUpdate(SQLModel):
-    owner_id: str | None = Field(default=None, min_length=1)
     product_url: str | None = Field(default=None, min_length=1)
     recipient_email: str | None = Field(default=None, min_length=3)
     starting_price: float | None = Field(default=None, ge=0)
@@ -241,7 +207,6 @@ class PriceAlertCheckAuditRead(PriceAlertCheckAuditBase):
 def create_price_alert(session: Session, alert: PriceAlertCreate) -> PriceAlert:
     db_alert = PriceAlert(
         alert_id=alert.alert_id or _default_alert_id(),
-        owner_id=alert.owner_id,
         product_url=alert.product_url,
         recipient_email=alert.recipient_email,
         starting_price=alert.starting_price,
@@ -270,85 +235,17 @@ def get_price_alert(session: Session, alert_id: str) -> PriceAlert | None:
     return session.get(PriceAlert, alert_id)
 
 
-def get_tester_account(session: Session, owner_id: str) -> TesterAccount | None:
-    return session.get(TesterAccount, owner_id)
-
-
-def get_tester_account_by_token_hash(
-    session: Session,
-    token_hash: str,
-) -> TesterAccount | None:
-    statement = select(TesterAccount).where(TesterAccount.token_hash == token_hash)
-    return session.exec(statement).first()
-
-
-def upsert_tester_account(session: Session, account: TesterAccount) -> TesterAccount:
-    account.recipient_email = normalize_email(account.recipient_email)
-    existing = session.get(TesterAccount, account.owner_id)
-    if existing is None:
-        session.add(account)
-        session.commit()
-        session.refresh(account)
-        return account
-
-    existing.token_hash = account.token_hash
-    existing.recipient_email = account.recipient_email
-    existing.role = account.role
-    existing.active_alert_limit = account.active_alert_limit
-    existing.manual_check_daily_limit = account.manual_check_daily_limit
-    session.add(existing)
-    session.commit()
-    session.refresh(existing)
-    return existing
-
-
-def count_active_price_alerts(
-    session: Session,
-    owner_id: str | None = None,
-) -> int:
-    statement = select(PriceAlert).where(PriceAlert.status == PriceAlertStatus.active)
-    if owner_id is not None:
-        statement = statement.where(PriceAlert.owner_id == owner_id)
-    return len(list(session.exec(statement)))
-
-
-def consume_manual_price_check(
-    session: Session,
-    owner_id: str,
-) -> tuple[TesterAccount | None, bool]:
-    account = session.get(TesterAccount, owner_id)
-    if account is None:
-        return None, False
-
-    today = current_price_alert_date()
-    if account.manual_check_window_date != today:
-        account.manual_check_window_date = today
-        account.manual_check_count = 0
-
-    if account.manual_check_count >= account.manual_check_daily_limit:
-        return account, False
-
-    account.manual_check_count += 1
-    session.add(account)
-    session.commit()
-    session.refresh(account)
-    return account, True
-
-
 def list_price_alerts(
     session: Session,
     status: PriceAlertStatus | None = None,
     limit: int | None = 100,
     recipient_email: str | None = None,
-    owner_id: str | None = None,
 ) -> list[PriceAlert]:
     statement = select(PriceAlert)
     if status is not None:
         statement = statement.where(PriceAlert.status == status)
     if recipient_email is not None:
         statement = statement.where(PriceAlert.recipient_email == normalize_email(recipient_email))
-    if owner_id is not None:
-        statement = statement.where(PriceAlert.owner_id == owner_id)
     if limit is not None:
         statement = statement.limit(limit)
     return list(session.exec(statement))
@@ -360,7 +257,6 @@ def list_price_alerts_due_today(
     limit: int | None = 100,
     due_date: date | None = None,
     recipient_email: str | None = None,
-    owner_id: str | None = None,
 ) -> list[PriceAlert]:
     due_date = due_date or current_price_alert_date()
     statement = select(PriceAlert).where(PriceAlert.next_check_at == due_date)
@@ -368,8 +264,6 @@ def list_price_alerts_due_today(
         statement = statement.where(PriceAlert.status == status)
     if recipient_email is not None:
         statement = statement.where(PriceAlert.recipient_email == normalize_email(recipient_email))
-    if owner_id is not None:
-        statement = statement.where(PriceAlert.owner_id == owner_id)
     if limit is not None:
         statement = statement.limit(limit)
     return list(session.exec(statement))

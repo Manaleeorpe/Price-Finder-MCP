@@ -19,35 +19,24 @@ from Tools.price_alerts import (
     PriceAlertCreate,
     PriceAlertStatus,
     PriceAlertUpdate,
-    consume_manual_price_check,
-    count_active_price_alerts,
     create_db_and_tables,
     create_price_alert,
     delete_price_alert,
-    get_tester_account,
     get_price_alert,
     is_database_configured,
+    is_price_alert_admin,
     list_price_alerts,
     list_price_alerts_due_today,
+    normalize_email,
     run_daily_price_alert_scheduler,
     run_scheduled_price_alert_check,
     session_scope,
     update_price_alert,
 )
-from Tools.price_alerts.auth import (
-    EnvBearerTokenVerifier,
-    TesterContext,
-    get_current_tester_context,
-    get_mcp_auth_settings,
-)
 from Tools.price_alerts.scheduler import extract_latest_price
 
 
-mcp = MCPServer(
-    "Price Checker",
-    auth=get_mcp_auth_settings(),
-    token_verifier=EnvBearerTokenVerifier(),
-)
+mcp = MCPServer("Price Checker")
 _price_alert_scheduler_thread: threading.Thread | None = None
 
 
@@ -63,31 +52,27 @@ def _alert_to_dict(alert) -> dict[str, Any]:
 
 
 def _access_denied() -> dict[str, Any]:
-    return {"success": False, "error": "Not authorized for this price alert"}
+    return {"success": False, "error": "This requester_email cannot access this price alert"}
 
 
-def _authentication_required() -> dict[str, Any]:
-    return {"success": False, "error": "Authentication required"}
+def _recipient_scope_for(requester_email: str) -> str | None:
+    requester_email = normalize_email(requester_email)
+    return None if is_price_alert_admin(requester_email) else requester_email
 
 
-def _limit_exceeded(message: str) -> dict[str, Any]:
-    return {"success": False, "error": message}
+def _can_access_alert(requester_email: str, alert) -> bool:
+    requester_email = normalize_email(requester_email)
+    return is_price_alert_admin(requester_email) or alert.recipient_email == requester_email
 
 
-def _current_tester() -> TesterContext | None:
-    return get_current_tester_context()
+def _can_use_recipient(requester_email: str, recipient_email: str) -> bool:
+    requester_email = normalize_email(requester_email)
+    recipient_email = normalize_email(recipient_email)
+    return is_price_alert_admin(requester_email) or requester_email == recipient_email
 
 
-def _owner_scope_for(tester: TesterContext) -> str | None:
-    return None if tester.is_admin else tester.owner_id
-
-
-def _can_access_alert(tester: TesterContext, alert) -> bool:
-    return tester.is_admin or alert.owner_id == tester.owner_id
-
-
-def _alert_resource_payload(alert_id: str) -> dict[str, Any]:
-    alert = get_price_alert_tool(alert_id)
+def _alert_resource_payload(requester_email: str, alert_id: str) -> dict[str, Any]:
+    alert = get_price_alert_tool(alert_id, requester_email)
     if alert.get("success") is False:
         return alert
 
@@ -107,15 +92,15 @@ def _alert_resource_payload(alert_id: str) -> dict[str, Any]:
 
 
 @mcp.resource(
-    "price-alert://alerts/{alert_id}",
+    "price-alert://users/{requester_email}/alerts/{alert_id}",
     name="price_alert",
     title="Price Alert",
-    description="Read an authorized price alert without recipient or credential data.",
+    description="Read an email-scoped price alert without recipient data.",
     mime_type="application/json",
 )
-def read_price_alert_resource(alert_id: str) -> str:
+def read_price_alert_resource(requester_email: str, alert_id: str) -> str:
     """Read a stored price alert by alert ID."""
-    return json.dumps(_alert_resource_payload(alert_id), ensure_ascii=False)
+    return json.dumps(_alert_resource_payload(requester_email, alert_id), ensure_ascii=False)
 
 
 @mcp.prompt(
@@ -123,9 +108,9 @@ def read_price_alert_resource(alert_id: str) -> str:
     title="Review Price Alert",
     description="Instruct the client to read and explain a stored price alert.",
 )
-def review_price_alert(alert_id: str) -> list[dict[str, Any]]:
-    """Review an existing authorized price alert from its read-only resource."""
-    resource_uri = f"price-alert://alerts/{alert_id}"
+def review_price_alert(requester_email: str, alert_id: str) -> list[dict[str, Any]]:
+    """Review an existing email-scoped price alert from its read-only resource."""
+    resource_uri = f"price-alert://users/{requester_email}/alerts/{alert_id}"
     return [
         {
             "role": "user",
@@ -153,62 +138,45 @@ def review_price_alert(alert_id: str) -> list[dict[str, Any]]:
 @log_mcp_tool("create_price_alert_tool")
 def create_price_alert_tool(
     product_url: str,
+    recipient_email: str,
+    requester_email: str,
     alert_id: str | None = None,
     status: PriceAlertStatus = PriceAlertStatus.active,
 ) -> dict[str, Any]:
     """Create a price alert using the current product price as its baseline."""
-    tester = _current_tester()
-    if tester is None:
-        return _authentication_required()
+    if not _can_use_recipient(requester_email, recipient_email):
+        return _access_denied()
 
+    price_response = check_price_now_tool(product_url)
+    current_price = extract_latest_price(price_response)
+    if current_price is None:
+        return {
+            "success": False,
+            "error": "Could not extract current price from price API response",
+            "price_response": price_response,
+        }
+
+    alert = PriceAlertCreate(
+        alert_id=alert_id,
+        product_url=product_url,
+        recipient_email=recipient_email,
+        starting_price=current_price,
+        lowest_notified_price=current_price,
+        status=status,
+    )
     with session_scope() as session:
-        account = get_tester_account(session, tester.owner_id)
-        if account is None:
-            return _authentication_required()
-
-        if (
-            status == PriceAlertStatus.active
-            and count_active_price_alerts(session, tester.owner_id)
-            >= account.active_alert_limit
-        ):
-            return _limit_exceeded(
-                f"Active alert limit reached: {account.active_alert_limit}"
-            )
-
-        price_response = check_price_now_tool(product_url)
-        current_price = extract_latest_price(price_response)
-        if current_price is None:
-            return {
-                "success": False,
-                "error": "Could not extract current price from price API response",
-                "price_response": price_response,
-            }
-
-        alert = PriceAlertCreate(
-            alert_id=alert_id,
-            owner_id=tester.owner_id,
-            product_url=product_url,
-            recipient_email=account.recipient_email,
-            starting_price=current_price,
-            lowest_notified_price=current_price,
-            status=status,
-        )
         return _alert_to_dict(create_price_alert(session, alert))
 
 
 @mcp.tool()
 @log_mcp_tool("get_price_alert_tool")
-def get_price_alert_tool(alert_id: str) -> dict[str, Any]:
+def get_price_alert_tool(alert_id: str, requester_email: str) -> dict[str, Any]:
     """Get a price alert by ID from Postgres."""
-    tester = _current_tester()
-    if tester is None:
-        return _authentication_required()
-
     with session_scope() as session:
         alert = get_price_alert(session, alert_id)
         if alert is None:
             return {"success": False, "error": f"Price alert not found: {alert_id}"}
-        if not _can_access_alert(tester, alert):
+        if not _can_access_alert(requester_email, alert):
             return _access_denied()
         return _alert_to_dict(alert)
 
@@ -216,14 +184,11 @@ def get_price_alert_tool(alert_id: str) -> dict[str, Any]:
 @mcp.tool()
 @log_mcp_tool("list_price_alerts_tool")
 def list_price_alerts_tool(
+    requester_email: str,
     status: PriceAlertStatus | None = None,
     limit: int = 100,
 ) -> list[dict[str, Any]]:
     """List price alerts from Postgres."""
-    tester = _current_tester()
-    if tester is None:
-        return [_authentication_required()]
-
     with session_scope() as session:
         return [
             _alert_to_dict(alert)
@@ -231,7 +196,7 @@ def list_price_alerts_tool(
                 session,
                 status=status,
                 limit=limit,
-                owner_id=_owner_scope_for(tester),
+                recipient_email=_recipient_scope_for(requester_email),
             )
         ]
 
@@ -239,14 +204,11 @@ def list_price_alerts_tool(
 @mcp.tool()
 @log_mcp_tool("list_price_alerts_due_today_tool")
 def list_price_alerts_due_today_tool(
+    requester_email: str,
     status: PriceAlertStatus | None = None,
     limit: int = 100,
 ) -> list[dict[str, Any]]:
     """List price alerts whose next_check_at is today."""
-    tester = _current_tester()
-    if tester is None:
-        return [_authentication_required()]
-
     with session_scope() as session:
         return [
             _alert_to_dict(alert)
@@ -254,30 +216,17 @@ def list_price_alerts_due_today_tool(
                 session,
                 status=status,
                 limit=limit,
-                owner_id=_owner_scope_for(tester),
+                recipient_email=_recipient_scope_for(requester_email),
             )
         ]
 
 
 @mcp.tool()
 @log_mcp_tool("run_scheduled_price_alert_check_tool")
-def run_scheduled_price_alert_check_tool() -> dict[str, Any]:
+def run_scheduled_price_alert_check_tool(requester_email: str) -> dict[str, Any]:
     """Manually run the due alert check that normally runs daily at 10:00 AM IST."""
-    tester = _current_tester()
-    if tester is None:
-        return _authentication_required()
-
-    with session_scope() as session:
-        account, consumed = consume_manual_price_check(session, tester.owner_id)
-        if account is None:
-            return _authentication_required()
-        if not consumed:
-            return _limit_exceeded(
-                f"Daily manual price check limit reached: {account.manual_check_daily_limit}"
-            )
-
     return run_scheduled_price_alert_check(
-        owner_id=_owner_scope_for(tester),
+        recipient_email=_recipient_scope_for(requester_email),
     )
 
 
@@ -285,7 +234,9 @@ def run_scheduled_price_alert_check_tool() -> dict[str, Any]:
 @log_mcp_tool("update_price_alert_tool")
 def update_price_alert_tool(
     alert_id: str,
+    requester_email: str,
     product_url: str | None = None,
+    recipient_email: str | None = None,
     starting_price: float | None = None,
     lowest_notified_price: float | None = None,
     latest_price: float | None = None,
@@ -294,12 +245,12 @@ def update_price_alert_tool(
     next_check_at: str | None = None,
 ) -> dict[str, Any]:
     """Update a price alert in Postgres."""
-    tester = _current_tester()
-    if tester is None:
-        return _authentication_required()
+    if recipient_email is not None and not _can_use_recipient(requester_email, recipient_email):
+        return _access_denied()
 
     alert_update = PriceAlertUpdate(
         product_url=product_url,
+        recipient_email=recipient_email,
         starting_price=starting_price,
         lowest_notified_price=lowest_notified_price,
         latest_price=latest_price,
@@ -311,23 +262,8 @@ def update_price_alert_tool(
         existing_alert = get_price_alert(session, alert_id)
         if existing_alert is None:
             return {"success": False, "error": f"Price alert not found: {alert_id}"}
-        if not _can_access_alert(tester, existing_alert):
+        if not _can_access_alert(requester_email, existing_alert):
             return _access_denied()
-        if (
-            status == PriceAlertStatus.active
-            and existing_alert.status != PriceAlertStatus.active
-        ):
-            account = (
-                get_tester_account(session, existing_alert.owner_id)
-                if existing_alert.owner_id is not None
-                else None
-            )
-            if account is None:
-                return _authentication_required()
-            if count_active_price_alerts(session, existing_alert.owner_id) >= account.active_alert_limit:
-                return _limit_exceeded(
-                    f"Active alert limit reached: {account.active_alert_limit}"
-                )
 
         alert = update_price_alert(session, alert_id, alert_update)
         if alert is None:
@@ -337,17 +273,13 @@ def update_price_alert_tool(
 
 @mcp.tool()
 @log_mcp_tool("delete_price_alert_tool")
-def delete_price_alert_tool(alert_id: str) -> dict[str, Any]:
+def delete_price_alert_tool(alert_id: str, requester_email: str) -> dict[str, Any]:
     """Delete a price alert from Postgres."""
-    tester = _current_tester()
-    if tester is None:
-        return _authentication_required()
-
     with session_scope() as session:
         alert = get_price_alert(session, alert_id)
         if alert is None:
             return {"success": False, "error": f"Price alert not found: {alert_id}"}
-        if not _can_access_alert(tester, alert):
+        if not _can_access_alert(requester_email, alert):
             return _access_denied()
 
         deleted = delete_price_alert(session, alert_id)
